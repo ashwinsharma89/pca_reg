@@ -1,0 +1,57 @@
+version: '3.8'
+
+services:
+  # PCA-Agent API Service
+  api:
+    build: .
+    command: python api.py
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./output:/app/output
+      - ./data:/app/data
+    environment:
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
+
+  # Streamlit Dashboard
+  dashboard:
+    build: .
+    command: streamlit run dashboard.py --server.port=8501 --server.address=0.0.0.0
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./output:/app/output
+      - ./data:/app/data
+    environment:
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
+
+  # MLflow Tracking Server
+  mlflow:
+    build: .
+    command: mlflow server --host 0.0.0.0 --port 5000 --backend-store-uri sqlite:///mlflow.db --default-artifact-root ./mlruns
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./mlruns:/app/mlruns
+      - ./mlflow.db:/app/mlflow.db
+    restart: unless-stopped
+
+  # Scheduler (optional - runs scheduled jobs)
+  scheduler:
+    build: .
+    command: python scheduler.py
+    volumes:
+      - ./output:/app/output
+      - ./data:/app/data
+      - ./scheduler_config.json:/app/scheduler_config.json
+    environment:
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
+    depends_on:
+      - api
+
+networks:
+  default:
+    name: pca-agent-network
