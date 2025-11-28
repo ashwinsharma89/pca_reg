@@ -427,3 +427,298 @@ class CampaignAnalyzer:
         summary.append("=" * 80)
         
         return "\n".join(summary)
+
+
+class ModelDiagnostics:
+    """
+    Handles residual diagnostics and statistical tests
+    """
+    
+    @staticmethod
+    def check_normality(residuals: np.ndarray) -> Dict[str, Any]:
+        """
+        Perform Shapiro-Wilk test for normality of residuals
+        
+        Args:
+            residuals: Model residuals
+            
+        Returns:
+            Test results
+        """
+        from scipy import stats
+        
+        # Shapiro-Wilk test (limit to 5000 samples for performance/validity)
+        if len(residuals) > 5000:
+            residuals_sample = np.random.choice(residuals, 5000, replace=False)
+        else:
+            residuals_sample = residuals
+            
+        stat, p_value = stats.shapiro(residuals_sample)
+        
+        return {
+            'test': 'Shapiro-Wilk',
+            'statistic': stat,
+            'p_value': p_value,
+            'is_normal': p_value > 0.05
+        }
+    
+    @staticmethod
+    def check_heteroscedasticity(residuals: np.ndarray, predictions: np.ndarray) -> Dict[str, Any]:
+        """
+        Perform Breusch-Pagan test for heteroscedasticity
+        
+        Args:
+            residuals: Model residuals
+            predictions: Model predictions (used as exog)
+            
+        Returns:
+            Test results
+        """
+        from statsmodels.stats.diagnostic import het_breuschpagan
+        import statsmodels.api as sm
+        
+        # Prepare exog matrix (constant + predictions)
+        exog = sm.add_constant(predictions)
+        
+        try:
+            lm, lm_p_value, fvalue, f_p_value = het_breuschpagan(residuals, exog)
+            
+            return {
+                'test': 'Breusch-Pagan',
+                'lm_statistic': lm,
+                'p_value': lm_p_value,
+                'is_homoscedastic': lm_p_value > 0.05
+            }
+        except Exception as e:
+            logger.warning(f"Breusch-Pagan test failed: {str(e)}")
+            return {'test': 'Breusch-Pagan', 'error': str(e)}
+    
+    @staticmethod
+    def check_multicollinearity(X: pd.DataFrame, threshold: float = 5.0) -> pd.DataFrame:
+        """
+        Calculate VIF for features
+        
+        Args:
+            X: Feature DataFrame
+            threshold: VIF threshold for high multicollinearity
+            
+        Returns:
+            DataFrame with VIF scores
+        """
+        from statsmodels.stats.outliers_influence import variance_inflation_factor
+        
+        # Filter numeric columns only
+        X_numeric = X.select_dtypes(include=[np.number])
+        
+        # Handle infinite/null values
+        X_numeric = X_numeric.replace([np.inf, -np.inf], np.nan).dropna()
+        
+        vif_data = pd.DataFrame()
+        vif_data["Feature"] = X_numeric.columns
+        
+        try:
+            vif_data["VIF"] = [variance_inflation_factor(X_numeric.values, i) 
+                              for i in range(len(X_numeric.columns))]
+        except Exception as e:
+            logger.warning(f"VIF calculation failed: {str(e)}")
+            vif_data["VIF"] = np.nan
+            
+        vif_data["High_Multicollinearity"] = vif_data["VIF"] > threshold
+        
+        return vif_data.sort_values("VIF", ascending=False)
+    
+    @staticmethod
+    def plot_diagnostics(residuals: np.ndarray, predictions: np.ndarray, save_path: Optional[str] = None):
+        """
+        Generate diagnostic plots
+        """
+        import matplotlib.pyplot as plt
+        import scipy.stats as stats
+        
+        fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+        
+        # Residuals vs Fitted
+        axes[0, 0].scatter(predictions, residuals, alpha=0.5)
+        axes[0, 0].axhline(y=0, color='r', linestyle='--')
+        axes[0, 0].set_xlabel('Fitted Values')
+        axes[0, 0].set_ylabel('Residuals')
+        axes[0, 0].set_title('Residuals vs Fitted')
+        
+        # Q-Q Plot
+        stats.probplot(residuals, dist="norm", plot=axes[0, 1])
+        axes[0, 1].set_title('Normal Q-Q')
+        
+        # Scale-Location
+        sqrt_abs_residuals = np.sqrt(np.abs(residuals))
+        axes[1, 0].scatter(predictions, sqrt_abs_residuals, alpha=0.5)
+        axes[1, 0].set_xlabel('Fitted Values')
+        axes[1, 0].set_ylabel('Sqrt(|Residuals|)')
+        axes[1, 0].set_title('Scale-Location')
+        
+        # Histogram of Residuals
+        axes[1, 1].hist(residuals, bins=30, edgecolor='black')
+        axes[1, 1].set_xlabel('Residuals')
+        axes[1, 1].set_title('Residual Distribution')
+        
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path)
+            logger.info(f"Diagnostic plots saved to {save_path}")
+        
+        plt.close()
+
+
+class ScenarioEngine:
+    """
+    Advanced What-If Scenario Engine
+    """
+    
+    def __init__(self, model, feature_names: List[str]):
+        self.model = model
+        self.feature_names = feature_names
+        
+    def simulate_scenarios(self, df: pd.DataFrame, 
+                          scenarios: List[Dict[str, Any]],
+                          target_col: str) -> pd.DataFrame:
+        """
+        Simulate multiple complex scenarios
+        
+        Args:
+            df: Baseline DataFrame
+            scenarios: List of scenario configs
+                e.g. [{'name': 'Pause FB', 'condition': 'platform == "Facebook"', 'action': 'drop'},
+                      {'name': 'Increase CPC 10%', 'feature': 'cpc', 'change': 1.10}]
+            target_col: Target column name
+            
+        Returns:
+            DataFrame with scenario results
+        """
+        results = []
+        baseline_pred = self.model.predict(df[self.feature_names])
+        baseline_total = baseline_pred.sum()
+        
+        results.append({
+            'Scenario': 'Baseline',
+            'Predicted_Target': baseline_total,
+            'Change_Pct': 0.0,
+            'Description': 'Current Performance'
+        })
+        
+        for scenario in scenarios:
+            df_scenario = df.copy()
+            name = scenario['name']
+            
+            # Apply scenario logic
+            if 'condition' in scenario and 'action' in scenario:
+                if scenario['action'] == 'drop':
+                    # Simulate dropping rows (e.g. pausing platform)
+                    mask = df_scenario.eval(scenario['condition'])
+                    df_scenario = df_scenario[~mask]
+                elif scenario['action'] == 'scale':
+                    # Scale specific rows
+                    mask = df_scenario.eval(scenario['condition'])
+                    factor = scenario.get('factor', 1.0)
+                    # This is tricky without knowing which feature is 'spend'
+                    # Assuming we just scale the predictions for now or need feature mapping
+                    pass
+            
+            elif 'feature' in scenario and 'change' in scenario:
+                # Modify a specific feature globally
+                feature = scenario['feature']
+                change = scenario['change']
+                if feature in df_scenario.columns:
+                    df_scenario[feature] = df_scenario[feature] * change
+            
+            # Predict
+            if len(df_scenario) > 0:
+                pred = self.model.predict(df_scenario[self.feature_names])
+                total = pred.sum()
+            else:
+                total = 0
+                
+            change_pct = ((total / baseline_total) - 1) * 100
+            
+            results.append({
+                'Scenario': name,
+                'Predicted_Target': total,
+                'Change_Pct': change_pct,
+                'Description': scenario.get('description', '')
+            })
+            
+        return pd.DataFrame(results)
+
+
+class ReportGenerator:
+    """
+    Handles dual-audience reporting
+    """
+    
+    @staticmethod
+    def generate_executive_brief(insights: Dict[str, Any], 
+                                optimization: Dict[str, Any]) -> str:
+        """
+        Generate high-level executive brief (non-technical)
+        """
+        lines = []
+        lines.append("# Executive Brief: Campaign Performance Analysis")
+        lines.append(f"Date: {pd.Timestamp.now().strftime('%Y-%m-%d')}\n")
+        
+        # 1. Headline Performance
+        if 'overall' in insights:
+            ov = insights['overall']
+            lines.append("## 1. Performance Snapshot")
+            lines.append(f"- **Total Spend**: ${ov.get('total_cost', 0):,.2f}")
+            lines.append(f"- **Actual Results**: {ov.get('mean_actual', 0):.2f} (avg per unit)")
+            lines.append(f"- **Model Accuracy**: The AI model predicts performance with {100 - ov.get('mean_pct_error', 0):.1f}% accuracy.\n")
+            
+        # 2. Key Drivers (from feature importance - need to pass this or extract)
+        lines.append("## 2. Strategic Recommendations")
+        if 'scenarios' in optimization:
+            best_scenario = max(optimization['scenarios'], key=lambda x: x['target_change_pct'])
+            lines.append(f"- **Opportunity**: {best_scenario['name']} could increase results by **{best_scenario['target_change_pct']:.1f}%**.")
+            
+        lines.append("\n## 3. Platform Performance")
+        if 'by_platform' in insights:
+            for platform, stats in insights['by_platform'].items():
+                lines.append(f"- **{platform}**: {stats.get('actual', 0):,.0f} conversions (Error: {stats.get('pct_error', 0):.1f}%)")
+                
+        return "\n".join(lines)
+    
+    @staticmethod
+    def generate_technical_report(model_results: pd.DataFrame,
+                                 diagnostics: Dict[str, Any],
+                                 feature_importance: pd.DataFrame) -> str:
+        """
+        Generate detailed technical report
+        """
+        lines = []
+        lines.append("# Technical Model Report")
+        lines.append(f"Generated: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        
+        # 1. Model Selection
+        lines.append("## 1. Model Evaluation Metrics")
+        lines.append(model_results.to_markdown(index=False))
+        lines.append("\n")
+        
+        # 2. Diagnostics
+        lines.append("## 2. Residual Diagnostics")
+        if 'normality' in diagnostics:
+            norm = diagnostics['normality']
+            lines.append(f"- **Normality (Shapiro-Wilk)**: p={norm.get('p_value', 0):.4f} ({'Normal' if norm.get('is_normal') else 'Non-Normal'})")
+        if 'heteroscedasticity' in diagnostics:
+            het = diagnostics['heteroscedasticity']
+            lines.append(f"- **Heteroscedasticity (Breusch-Pagan)**: p={het.get('p_value', 0):.4f} ({'Homoscedastic' if het.get('is_homoscedastic') else 'Heteroscedastic'})")
+            
+        # 3. Multicollinearity
+        lines.append("\n## 3. Feature Analysis (VIF)")
+        if 'vif' in diagnostics:
+            vif_df = diagnostics['vif']
+            high_vif = vif_df[vif_df['High_Multicollinearity']]
+            if not high_vif.empty:
+                lines.append("High Multicollinearity detected in:")
+                lines.append(high_vif.to_markdown(index=False))
+            else:
+                lines.append("No significant multicollinearity detected (VIF < 5).")
+                
+        return "\n".join(lines)

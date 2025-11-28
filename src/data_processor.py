@@ -123,7 +123,6 @@ class DataProcessor:
         for col in df_typed.columns:
             if 'date' in col.lower() or 'time' in col.lower():
                 try:
-                    df_typed[col] = pd.to_datetime(df_typed[col])
                     logger.info(f"Converted {col} to datetime")
                 except:
                     pass
@@ -203,6 +202,111 @@ class DataProcessor:
             logger.info(f"Normalized {len(numeric_cols)} numerical columns")
         
         return df_normalized
+
+
+class DataValidator:
+    """
+    Handles data validation and quality checks
+    """
+    
+    def __init__(self):
+        self.required_columns = ['date', 'cost']  # Minimal set
+        
+    def validate_schema(self, df: pd.DataFrame, required_columns: list = None) -> dict:
+        """
+        Check if required columns exist
+        
+        Args:
+            df: Input DataFrame
+            required_columns: List of required column names
+            
+        Returns:
+            Dictionary with validation status and missing columns
+        """
+        if required_columns is None:
+            required_columns = self.required_columns
+            
+        missing_cols = [col for col in required_columns if col not in df.columns]
+        
+        return {
+            'valid': len(missing_cols) == 0,
+            'missing_columns': missing_cols
+        }
+    
+    def check_data_quality(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Generate a data quality report
+        
+        Args:
+            df: Input DataFrame
+            
+        Returns:
+            DataFrame with quality metrics per column
+        """
+        quality_report = pd.DataFrame({
+            'dtype': df.dtypes,
+            'null_count': df.isnull().sum(),
+            'null_pct': (df.isnull().sum() / len(df)) * 100,
+            'unique_count': df.nunique(),
+            'duplicate_count': df.duplicated().sum()
+        })
+        
+        # Add basic stats for numeric columns
+        numeric_cols = df.select_dtypes(include=[np.number]).columns
+        if len(numeric_cols) > 0:
+            desc = df[numeric_cols].describe().T
+            quality_report = quality_report.join(desc[['min', 'max', 'mean', 'std']], how='left')
+            
+        return quality_report.sort_values('null_pct', ascending=False)
+
+    def generate_quality_summary(self, df: pd.DataFrame) -> str:
+        """
+        Generate a text summary of data quality
+        
+        Args:
+            df: Input DataFrame
+            
+        Returns:
+            String summary
+        """
+        report = self.check_data_quality(df)
+        
+        summary = []
+        summary.append("DATA QUALITY SUMMARY")
+        summary.append("=" * 50)
+        summary.append(f"Total Rows: {len(df)}")
+        summary.append(f"Total Columns: {len(df.columns)}")
+        summary.append(f"Duplicate Rows: {df.duplicated().sum()}")
+        summary.append("-" * 50)
+        
+        # Nulls
+        high_nulls = report[report['null_pct'] > 0]
+        if not high_nulls.empty:
+            summary.append("\nColumns with Missing Values:")
+            for idx, row in high_nulls.iterrows():
+                summary.append(f"  - {idx}: {row['null_count']} ({row['null_pct']:.1f}%)")
+        else:
+            summary.append("\nNo missing values found.")
+            
+        # Outliers (basic check using Z-score > 3 for numeric)
+        numeric_cols = df.select_dtypes(include=[np.number]).columns
+        if len(numeric_cols) > 0:
+            summary.append("\nPotential Outliers (Z-score > 3):")
+            from scipy import stats
+            try:
+                z_scores = np.abs(stats.zscore(df[numeric_cols].fillna(df[numeric_cols].mean())))
+                outliers = (z_scores > 3).sum(axis=0)
+                outliers = outliers[outliers > 0]
+                
+                if not outliers.empty:
+                    for col, count in outliers.items():
+                        summary.append(f"  - {col}: {count} rows")
+                else:
+                    summary.append("  None detected.")
+            except:
+                summary.append("  Could not calculate outliers (possible constant values).")
+                
+        return "\n".join(summary)
     
     def preprocess_pipeline(self, df: pd.DataFrame,
                            target_col: str,

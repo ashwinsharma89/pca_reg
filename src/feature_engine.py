@@ -396,3 +396,75 @@ class FeatureEngineer:
         logger.info(f"Final shape: {df_engineered.shape}")
         
         return df_engineered
+    
+    def select_features(self, df: pd.DataFrame, 
+                       target_col: str,
+                       method: str = 'correlation',
+                       threshold: float = 0.95) -> pd.DataFrame:
+        """
+        Select features to reduce multicollinearity and noise
+        
+        Args:
+            df: Input DataFrame
+            target_col: Target column name
+            method: Selection method ('correlation', 'vif')
+            threshold: Threshold for removal (correlation coef or VIF value)
+            
+        Returns:
+            DataFrame with selected features
+        """
+        logger.info(f"Selecting features using {method} method...")
+        
+        # Separate target
+        if target_col in df.columns:
+            y = df[target_col]
+            X = df.drop(columns=[target_col])
+        else:
+            X = df.copy()
+            
+        # Keep only numeric columns for selection
+        X_numeric = X.select_dtypes(include=[np.number])
+        dropped_cols = []
+        
+        if method == 'correlation':
+            # Calculate correlation matrix
+            corr_matrix = X_numeric.corr().abs()
+            
+            # Select upper triangle of correlation matrix
+            upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+            
+            # Find features with correlation greater than threshold
+            dropped_cols = [column for column in upper.columns if any(upper[column] > threshold)]
+            
+            logger.info(f"Dropping {len(dropped_cols)} features due to high correlation (> {threshold})")
+            
+        elif method == 'vif':
+            from statsmodels.stats.outliers_influence import variance_inflation_factor
+            
+            # Iteratively drop features with high VIF
+            X_vif = X_numeric.copy()
+            X_vif = X_vif.replace([np.inf, -np.inf], np.nan).dropna()
+            
+            while True:
+                vif_data = pd.DataFrame()
+                vif_data["feature"] = X_vif.columns
+                try:
+                    vif_data["VIF"] = [variance_inflation_factor(X_vif.values, i) 
+                                      for i in range(len(X_vif.columns))]
+                except:
+                    break
+                
+                max_vif = vif_data["VIF"].max()
+                if max_vif > threshold:
+                    feature_to_drop = vif_data.sort_values("VIF", ascending=False)["feature"].iloc[0]
+                    X_vif = X_vif.drop(columns=[feature_to_drop])
+                    dropped_cols.append(feature_to_drop)
+                else:
+                    break
+            
+            logger.info(f"Dropping {len(dropped_cols)} features due to high VIF (> {threshold})")
+            
+        # Drop selected columns from original dataframe
+        df_selected = df.drop(columns=dropped_cols)
+        
+        return df_selected

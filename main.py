@@ -13,10 +13,10 @@ import logging
 # Add src to path
 sys.path.insert(0, os.path.dirname(__file__))
 
-from src.data_processor import DataProcessor
+from src.data_processor import DataProcessor, DataValidator
 from src.feature_engine import FeatureEngineer
 from src.modeler import CampaignModeler
-from src.analyzer import CampaignAnalyzer
+from src.analyzer import CampaignAnalyzer, ModelDiagnostics, ReportGenerator, ScenarioEngine
 from src.config import RANDOM_STATE, TEST_SIZE, MODELS_TO_TRAIN
 from src.utils import create_output_directory, logger
 
@@ -101,6 +101,15 @@ def run_pca_agent(data_path: str = None,
     logger.info(f"Data loaded: {df.shape[0]} rows, {df.shape[1]} columns")
     print(f"\nData Preview:\n{df.head()}")
     
+    # ========== STEP 1.5: DATA VALIDATION ==========
+    logger.info("\n[STEP 1.5] Validating Data...")
+    validator = DataValidator()
+    quality_report = validator.generate_quality_summary(df)
+    print(f"\n{quality_report}")
+    
+    with open(f'{output_dir}/data_quality_report.txt', 'w') as f:
+        f.write(quality_report)
+    
     # ========== STEP 2: DATA PREPROCESSING ==========
     logger.info("\n[STEP 2] Preprocessing Data...")
     
@@ -114,7 +123,7 @@ def run_pca_agent(data_path: str = None,
     y = df_typed[target_column].copy()
     X = df_typed.drop(columns=[target_column])
     
-    # Encode categorical variables with label encoding (simpler than target encoding)
+    # Encode categorical variables with label encoding
     X_encoded = processor.encode_categorical(X, target_col=None, method='label')
     
     logger.info(f"Preprocessed data: {X_encoded.shape[1]} features")
@@ -128,23 +137,28 @@ def run_pca_agent(data_path: str = None,
         date_col='date' if 'date' in X_encoded.columns else None,
         create_media=True,
         create_time=True,
-        create_lags=False,  # Set to True for time series
+        create_lags=False,
         create_rolling=False,
         create_adstock=False
     )
     
     logger.info(f"Feature engineering complete: {X_engineered.shape[1]} features")
     
-    # Remove date column if present (can't use in modeling)
+    # Remove date column if present
     if 'date' in X_engineered.columns:
         X_engineered = X_engineered.drop(columns=['date'])
+        
+    # ========== STEP 3.5: FEATURE SELECTION ==========
+    logger.info("\n[STEP 3.5] Selecting Features...")
+    X_selected = engineer.select_features(X_engineered, target_col=None, method='correlation', threshold=0.95)
+    logger.info(f"Selected {X_selected.shape[1]} features from {X_engineered.shape[1]}")
     
     # ========== STEP 4: TRAIN-TEST SPLIT ==========
     logger.info("\n[STEP 4] Splitting Data...")
     
     from sklearn.model_selection import train_test_split
     X_train, X_test, y_train, y_test = train_test_split(
-        X_engineered, y, test_size=TEST_SIZE, random_state=RANDOM_STATE
+        X_selected, y, test_size=TEST_SIZE, random_state=RANDOM_STATE
     )
     
     logger.info(f"Train set: {X_train.shape[0]} samples")
@@ -159,7 +173,7 @@ def run_pca_agent(data_path: str = None,
     if models_to_train is None:
         models_to_train = MODELS_TO_TRAIN
     
-    # Train subset of fast models for demo (you can train all)
+    # Train subset of fast models for demo
     quick_models = ['linear', 'lasso', 'ridge', 'elasticnet', 'random_forest', 
                    'gradient_boosting', 'xgboost']
     models_to_use = [m for m in quick_models if m in models_to_train]
@@ -176,7 +190,12 @@ def run_pca_agent(data_path: str = None,
     # ========== STEP 6: MODEL EVALUATION ==========
     logger.info("\n[STEP 6] Evaluating Models...")
     
-    results_df = modeler.evaluate_all_models(X_test, y_test)
+    # Pass full data for Cross-Validation
+    results_df = modeler.evaluate_all_models(
+        X_test, y_test,
+        X_full=X_selected,
+        y_full=y
+    )
     print(f"\n{results_df.to_string()}")
     
     # Save results
@@ -196,6 +215,15 @@ def run_pca_agent(data_path: str = None,
     
     print(f"\nTop 10 Important Features:\n{feature_importance.head(10)}")
     feature_importance.to_csv(f'{output_dir}/feature_importance.csv', index=False)
+    
+    # ========== STEP 7.5: DIAGNOSTICS ==========
+    logger.info("\n[STEP 7.5] Running Diagnostics...")
+    diagnostics = modeler.run_diagnostics(X_test, y_test)
+    ModelDiagnostics.plot_diagnostics(
+        y_test - best_model.predict(X_test),
+        best_model.predict(X_test),
+        save_path=f'{output_dir}/diagnostics_plots.png'
+    )
     
     # ========== STEP 8: GENERATE INSIGHTS ==========
     logger.info("\n[STEP 8] Generating Insights...")
@@ -222,8 +250,8 @@ def run_pca_agent(data_path: str = None,
     for key, value in insights['overall'].items():
         print(f"  {key}: {value}")
     
-    # ========== STEP 9: BUDGET OPTIMIZATION ==========
-    logger.info("\n[STEP 9] Budget Optimization...")
+    # ========== STEP 9: BUDGET OPTIMIZATION & SCENARIOS ==========
+    logger.info("\n[STEP 9] Budget Optimization & Scenarios...")
     
     current_budget = df_test['cost'].sum()
     optimization = analyzer.simulate_budget_optimization(
@@ -233,28 +261,35 @@ def run_pca_agent(data_path: str = None,
         cost_col='cost'
     )
     
+    # Advanced Scenarios
+    scenario_engine = ScenarioEngine(best_model, X_train.columns.tolist())
+    advanced_scenarios = [
+        {'name': 'Increase Spend 20%', 'feature': 'cost', 'change': 1.20, 'description': 'Scale up budget aggressively'},
+        {'name': 'Decrease Spend 20%', 'feature': 'cost', 'change': 0.80, 'description': 'Conservative budget cut'}
+    ]
+    # Note: This requires 'cost' to be in X_train, which it might not be if we dropped it or engineered it.
+    # For now, we'll skip advanced scenario execution if features don't match, or we need to map them.
+    
     print(f"\nBudget Optimization Scenarios:")
     for scenario in optimization['scenarios']:
         print(f"\n{scenario['name']}:")
         print(f"  New Budget: ${scenario['new_budget']:,.2f}")
         print(f"  Expected Change: {scenario['target_change_pct']:.1f}%")
     
-    # ========== STEP 10: EXECUTIVE SUMMARY ==========
-    logger.info("\n[STEP 10] Generating Executive Summary...")
+    # ========== STEP 10: DUAL-AUDIENCE REPORTING ==========
+    logger.info("\n[STEP 10] Generating Reports...")
     
-    summary = analyzer.generate_executive_summary(
-        results_df,
-        insights,
-        optimization
-    )
+    # Executive Brief
+    exec_brief = ReportGenerator.generate_executive_brief(insights, optimization)
+    with open(f'{output_dir}/executive_brief.md', 'w') as f:
+        f.write(exec_brief)
+        
+    # Technical Report
+    tech_report = ReportGenerator.generate_technical_report(results_df, diagnostics, feature_importance)
+    with open(f'{output_dir}/technical_report.md', 'w') as f:
+        f.write(tech_report)
     
-    print(f"\n{summary}")
-    
-    # Save summary
-    with open(f'{output_dir}/executive_summary.txt', 'w') as f:
-        f.write(summary)
-    
-    logger.info(f"\nExecutive summary saved to {output_dir}/executive_summary.txt")
+    print(f"\nReports generated: {output_dir}/executive_brief.md, {output_dir}/technical_report.md")
     
     # ========== COMPLETE ==========
     logger.info("\n" + "=" * 80)
@@ -268,7 +303,8 @@ def run_pca_agent(data_path: str = None,
         'results': results_df,
         'insights': insights,
         'optimization': optimization,
-        'feature_importance': feature_importance
+        'feature_importance': feature_importance,
+        'diagnostics': diagnostics
     }
 
 

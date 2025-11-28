@@ -266,13 +266,17 @@ class CampaignModeler:
         return metrics
     
     def evaluate_all_models(self, X_test: pd.DataFrame, 
-                           y_test: pd.Series) -> pd.DataFrame:
+                           y_test: pd.Series,
+                           X_full: Optional[pd.DataFrame] = None,
+                           y_full: Optional[pd.Series] = None) -> pd.DataFrame:
         """
-        Evaluate all trained models
+        Evaluate all trained models with CV support
         
         Args:
             X_test: Test features
             y_test: Test target
+            X_full: Full features (for CV)
+            y_full: Full target (for CV)
             
         Returns:
             DataFrame with evaluation results
@@ -281,19 +285,37 @@ class CampaignModeler:
         
         results_list = []
         
+        from sklearn.model_selection import cross_validate
+        
         for model_name in self.trained_models.keys():
             try:
+                # Standard evaluation
                 metrics = self.evaluate_model(model_name, X_test, y_test)
+                
+                # Cross-validation if full data provided
+                if X_full is not None and y_full is not None:
+                    cv_results = cross_validate(
+                        self.trained_models[model_name], 
+                        X_full, 
+                        y_full, 
+                        cv=CV_FOLDS,
+                        scoring=['r2', 'neg_root_mean_squared_error'],
+                        n_jobs=-1
+                    )
+                    metrics['CV_R2_Mean'] = cv_results['test_r2'].mean()
+                    metrics['CV_R2_Std'] = cv_results['test_r2'].std()
+                    metrics['CV_RMSE_Mean'] = -cv_results['test_neg_root_mean_squared_error'].mean()
+                
                 results_list.append(metrics)
             except Exception as e:
                 logger.error(f"Error evaluating {model_name}: {str(e)}")
                 continue
         
         results_df = pd.DataFrame(results_list)
-        results_df = results_df.sort_values('R2', ascending=False)
+        if not results_df.empty:
+            results_df = results_df.sort_values('R2', ascending=False)
         
         logger.info("Evaluation complete")
-        logger.info(f"\n{results_df.to_string()}")
         
         return results_df
     
@@ -360,39 +382,29 @@ class CampaignModeler:
         
         return importance_df
     
-    def cross_validate_model(self, model_name: str, X: pd.DataFrame, y: pd.Series,
-                            cv_folds: int = CV_FOLDS) -> Dict[str, float]:
+    def run_diagnostics(self, X_test: pd.DataFrame, y_test: pd.Series) -> Dict[str, Any]:
         """
-        Perform cross-validation on a model
+        Run diagnostics on the best model
         
         Args:
-            model_name: Name of the model
-            X: Features
-            y: Target
-            cv_folds: Number of folds
+            X_test: Test features
+            y_test: Test target
             
         Returns:
-            Dictionary of CV scores
+            Dictionary of diagnostic results
         """
-        logger.info(f"Cross-validating {model_name}...")
+        if self.best_model is None:
+            raise ValueError("No best model selected")
+            
+        from src.analyzer import ModelDiagnostics
         
-        if model_name not in self.trained_models:
-            raise ValueError(f"Model {model_name} not trained yet")
+        predictions = self.best_model.predict(X_test)
+        residuals = y_test - predictions
         
-        model = self.trained_models[model_name]
-        
-        cv_scores = cross_val_score(model, X, y, cv=cv_folds, 
-                                   scoring='neg_mean_squared_error', n_jobs=-1)
-        
-        cv_rmse = np.sqrt(-cv_scores)
-        
-        results = {
-            'mean_cv_rmse': cv_rmse.mean(),
-            'std_cv_rmse': cv_rmse.std(),
-            'min_cv_rmse': cv_rmse.min(),
-            'max_cv_rmse': cv_rmse.max()
+        diagnostics = {
+            'normality': ModelDiagnostics.check_normality(residuals),
+            'heteroscedasticity': ModelDiagnostics.check_heteroscedasticity(residuals, predictions),
+            'vif': ModelDiagnostics.check_multicollinearity(X_test)
         }
         
-        logger.info(f"CV RMSE: {results['mean_cv_rmse']:.4f} (+/- {results['std_cv_rmse']:.4f})")
-        
-        return results
+        return diagnostics
